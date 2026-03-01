@@ -13,7 +13,12 @@
           wget -O shah "https://raw.githubusercontent.com/ToolSeRF/KING-Paqet-Tunnel-Manager-with-offline-mode/main/shah?$(date+%s)" && chmod +x shah && bash ./shah
 
 
+ 
+ 
   [برای دانلود فایل اینجا کلیک کنید ](https://github.com/ToolSeRF/KING-Paqet-Tunnel-Manager-with-offline-mode/releases/download/v1/shah)
+
+  بعد از دانلود فایل و آپلود آن روی سرور
+  ````chmod +x shah && bash ./shah````
       
 2. سپس با استفاده از گزینه ی 1 باینری و ابزارهای مورد نیاز برای paqet را روی سرور خود نصب کنید
     - از دو حالت آفلاین مود و آنلاین مود برای نصب می توانید استفاده کنید.
