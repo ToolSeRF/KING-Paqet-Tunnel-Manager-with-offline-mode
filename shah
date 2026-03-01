@@ -942,6 +942,49 @@ install_offline_flow() {
   done
 }
 
+install_paqet_binary_online() {
+  detect_arch
+  local arch="$ARCH_TAG"
+  if [[ "$arch" != "amd64" && "$arch" != "arm64" ]]; then
+    log_err "Unsupported arch: $(uname -m)"
+    return 1
+  fi
+
+  local ver="v1.0.0-alpha.19"
+  local url_amd64="https://github.com/hanselime/paqet/releases/download/${ver}/paqet-linux-amd64-${ver}.tar.gz"
+  local url_arm64="https://github.com/hanselime/paqet/releases/download/${ver}/paqet-linux-arm64-${ver}.tar.gz"
+  local url=""
+  if [[ "$arch" == "amd64" ]]; then url="$url_amd64"; else url="$url_arm64"; fi
+
+  local tar="/root/paqet_${arch}_${ver}.tar.gz"
+  download_file "$url" "$tar" || return 1
+  extract_targz_in_place "$tar" "/root/paqet_extract_${arch}" || return 1
+
+  local bin=""
+  if [[ "$arch" == "amd64" ]]; then
+    bin="$(find "/root/paqet_extract_${arch}" -type f -iname "*paqet*amd64*" 2>/dev/null | head -n 1 || true)"
+  else
+    bin="$(find "/root/paqet_extract_${arch}" -type f -iname "*paqet*arm64*" 2>/dev/null | head -n 1 || true)"
+  fi
+
+  if [[ -z "$bin" ]]; then
+    bin="$(find "/root/paqet_extract_${arch}" -type f -iname "paqet*" 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -z "$bin" ]]; then
+    log_err "Could not find extracted paqet binary"
+    return 1
+  fi
+
+  chmod +x "$bin" || true
+  if cp -f "$bin" /usr/local/bin/paqet; then
+    chmod +x /usr/local/bin/paqet || true
+    log_ok "Installed /usr/local/bin/paqet (online)"
+  else
+    log_err "Copy to /usr/local/bin/paqet failed"
+    return 1
+  fi
+}
+
 install_online_flow() {
   render_header; render_log_box
   log_info "Online mode selected"
