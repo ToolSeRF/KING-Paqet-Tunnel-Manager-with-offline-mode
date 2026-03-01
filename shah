@@ -1,0 +1,2362 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+
+LOG_LINES=()
+MAX_LOG_LINES=4000
+
+BANNER_TITLE="KING"
+APP_TITLE="MAKE IRAN GREAT AGAIN"
+LOG_BOX_MIN_HEIGHT=7
+
+c_reset="$(tput sgr0 2>/dev/null || true)"
+c_bold="$(tput bold 2>/dev/null || true)"
+c_dim="$(tput dim 2>/dev/null || true)"
+c_red="$(tput setaf 1 2>/dev/null || true)"
+c_green="$(tput setaf 2 2>/dev/null || true)"
+c_yellow="$(tput setaf 3 2>/dev/null || true)"
+c_blue="$(tput setaf 4 2>/dev/null || true)"
+c_cyan="$(tput setaf 6 2>/dev/null || true)"
+
+add_log() {
+  local msg="$1"
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  LOG_LINES+=("[$ts] $msg")
+  if ((${#LOG_LINES[@]} > MAX_LOG_LINES)); then
+    LOG_LINES=("${LOG_LINES[@]: -MAX_LOG_LINES}")
+  fi
+}
+
+log_info(){ add_log "${c_cyan}INFO${c_reset}  $*"; }
+log_ok(){ add_log "${c_green}OK${c_reset}    $*"; }
+log_warn(){ add_log "${c_yellow}WARN${c_reset}  $*"; }
+log_err(){ add_log "${c_red}ERR${c_reset}   $*"; }
+
+term_cols(){ tput cols 2>/dev/null || echo 100; }
+term_lines(){ tput lines 2>/dev/null || echo 40; }
+
+hr() {
+  local ch="${1:--}"
+  local n; n="$(term_cols)"
+  printf '%*s\n' "$n" '' | tr ' ' "$ch"
+}
+
+clear_screen() { tput clear 2>/dev/null || clear; }
+
+render_header() {
+  local cols; cols="$(term_cols)"
+  clear_screen
+  echo "${c_bold}${c_blue}$(printf "%*s" $(( (cols+${#BANNER_TITLE})/2 )) "$BANNER_TITLE")${c_reset}"
+  echo "${c_dim}$(printf "%*s" $(( (cols+${#APP_TITLE})/2 )) "$APP_TITLE")${c_reset}"
+  hr "="
+}
+
+render_log_box() {
+  local total_lines; total_lines="$(term_lines)"
+  local log_h="$LOG_BOX_MIN_HEIGHT"
+  if (( total_lines < 28 )); then log_h=8; fi
+
+  echo "${c_bold}Action Log${c_reset}"
+  hr "-"
+  local start=0
+  local n="${#LOG_LINES[@]}"
+  if (( n > log_h )); then start=$((n - log_h)); fi
+  local cols; cols="$(term_cols)"
+
+  local i="$start"
+  while (( i < n )); do
+    local line="${LOG_LINES[i]}"
+    if ((${#line} > cols)); then line="${line:0:cols-3}..."; fi
+    printf '%s\n' "$line"
+    i=$((i+1))
+  done
+
+  local shown=$((n - start))
+  local pad=0
+  while (( pad < (log_h - shown) )); do
+    echo
+    pad=$((pad+1))
+  done
+  hr "="
+}
+
+pause_enter() {
+  echo
+  read -r -p "Press Enter to continue..." _
+}
+
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "This script must be run as root."
+    exit 1
+  fi
+}
+
+ensure_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+read_line() {
+  local prompt="$1" __var="$2" def="${3:-}"
+  local out=""
+  if [[ -n "$def" ]]; then
+    read -er -p "$prompt" -i "$def" out
+  else
+    read -er -p "$prompt" out
+  fi
+  printf -v "$__var" '%s' "$out"
+}
+
+ask_choice_once() {
+  local prompt="$1" __var="$2"; shift 2
+  local allowed=("$@")
+  local v=""
+  read_line "$prompt" v
+  v="${v// /}"
+  local ok="0"
+  for a in "${allowed[@]}"; do
+    if [[ "$v" == "$a" ]]; then ok="1"; break; fi
+  done
+  if [[ "$ok" == "1" ]]; then
+    printf -v "$__var" '%s' "$v"
+    return 0
+  fi
+  log_warn "Invalid choice. Allowed: ${allowed[*]}"
+  return 1
+}
+
+read_int_range() {
+  local prompt="$1" __var="$2" min="$3" max="$4" def="${5:-}"
+  local v=""
+  while true; do
+    if [[ -n "$def" ]]; then read_line "$prompt" v "$def"; else read_line "$prompt" v; fi
+    v="${v// /}"
+    if [[ -z "$v" && -n "$def" ]]; then v="$def"; fi
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= min && v <= max )); then
+      printf -v "$__var" '%s' "$v"
+      return 0
+    fi
+    log_warn "Invalid number. Allowed range: $min-$max"
+    render_header; render_log_box
+  done
+}
+
+normalize_port() {
+  local p="$1"
+  [[ -z "$p" ]] && return 1
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 )) || return 1
+  echo "$p"
+}
+
+validate_ipv4() {
+  local ip="$1"
+  [[ -z "$ip" ]] && return 1
+  if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    return 1
+  fi
+  local IFS='.'
+  local -a o
+  read -r -a o <<< "$ip"
+  [[ "${#o[@]}" -ne 4 ]] && return 1
+  local x
+  for x in "${o[@]}"; do
+    [[ "$x" =~ ^[0-9]+$ ]] || return 1
+    (( x >= 0 && x <= 255 )) || return 1
+  done
+  return 0
+}
+
+read_ipv4_loop() {
+  local prompt="$1" __var="$2" def="${3:-}"
+  local ip=""
+  while true; do
+    if [[ -n "$def" ]]; then
+      read_line "$prompt" ip "$def"
+    else
+      read_line "$prompt" ip
+    fi
+    ip="${ip// /}"
+    if validate_ipv4 "$ip"; then
+      printf -v "$__var" '%s' "$ip"
+      return 0
+    fi
+    log_warn "Invalid IPv4. Example: 1.2.3.4"
+    render_header; render_log_box
+  done
+}
+
+DISTRO="unknown"
+DISTRO_VER="unknown"
+ARCH_TAG="unknown"
+
+detect_distro() {
+  DISTRO="unknown"; DISTRO_VER="unknown"
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    DISTRO="${ID:-unknown}"
+    DISTRO_VER="${VERSION_ID:-unknown}"
+  fi
+}
+
+detect_arch() {
+  local m; m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64) ARCH_TAG="amd64" ;;
+    aarch64|arm64) ARCH_TAG="arm64" ;;
+    *) ARCH_TAG="unknown" ;;
+  esac
+}
+
+default_interface() { ip route 2>/dev/null | awk '/default/ {print $5; exit}'; }
+
+default_local_ip_for_iface() {
+  local iface="$1"
+  ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
+}
+
+download_file() {
+  local url="$1" out="$2"
+  log_info "Downloading: $url -> $out"
+  if ensure_cmd curl; then
+    if curl -fL --connect-timeout 10 --retry 2 -o "$out" "$url"; then
+      log_ok "Downloaded $out"
+      return 0
+    fi
+  fi
+  if ensure_cmd wget; then
+    if wget -q -O "$out" "$url"; then
+      log_ok "Downloaded $out"
+      return 0
+    fi
+  fi
+  log_err "Download failed: $url"
+  return 1
+}
+
+extract_targz_in_place() {
+  local file="$1" dest="$2"
+  mkdir -p "$dest"
+
+  if [[ ! -f "$file" ]]; then
+    log_err "Archive not found: $file"
+    return 1
+  fi
+
+  if ensure_cmd gzip; then
+    if ! gzip -t "$file" >/dev/null 2>&1; then
+      log_err "Archive is corrupted/incomplete (gzip test failed): $file"
+      return 1
+    fi
+  fi
+
+  log_info "Extracting: $file -> $dest"
+  local errf="/tmp/paqet_extract_err.$$"
+  if tar -xzf "$file" -C "$dest" >/dev/null 2>"$errf"; then
+    rm -f "$errf" 2>/dev/null || true
+    log_ok "Extracted $file"
+    return 0
+  fi
+
+  local errtxt=""
+  errtxt="$(head -n 2 "$errf" 2>/dev/null | tr '\n' ' ' || true)"
+  rm -f "$errf" 2>/dev/null || true
+
+  if echo "$errtxt" | grep -qi "unexpected end of file"; then
+    log_err "Extract failed: archive is incomplete (download interrupted). File: $file"
+  else
+    log_err "Extract failed: $file | $errtxt"
+  fi
+  return 1
+}
+
+DEPS_LIST=(libpcap-dev net-tools iptables arp-scan curl wget git iptables-persistent)
+
+install_deps_offline_from_dir() {
+  local dir="$1"
+  local failed=()
+  local okcount=0
+  local failcount=0
+
+  log_info "Offline deps install from: $dir"
+  if [[ ! -d "$dir" ]]; then
+    log_err "Deps dir not found: $dir"
+    return 1
+  fi
+
+  find_deb_for_pkg() {
+    local base="$1" pkg="$2"
+    local f=""
+    f="$(find "$base" -type f \( \
+          -name "${pkg}_*.deb" -o \
+          -name "${pkg}-*.deb" -o \
+          -name "${pkg}*.deb" \
+        \) 2>/dev/null | head -n 1 || true)"
+    echo "$f"
+  }
+
+  for pkg in "${DEPS_LIST[@]}"; do
+    local deb
+    deb="$(find_deb_for_pkg "$dir" "$pkg")"
+
+    if [[ -z "$deb" || ! -f "$deb" ]]; then
+      log_warn "DEB not found for: $pkg (skipping)"
+      failed+=("$pkg")
+      failcount=$((failcount+1))
+      render_header; render_log_box
+      continue
+    fi
+
+    log_info "Installing $pkg from $deb"
+
+    if dpkg -i "$deb" >/dev/null 2>&1; then
+      log_ok "$pkg installed"
+      okcount=$((okcount+1))
+    else
+      if ensure_cmd apt-get; then
+        log_warn "$pkg dpkg failed, trying apt-get -f install"
+        DEBIAN_FRONTEND=noninteractive apt-get -y -f install >/dev/null 2>&1 || true
+        if dpkg -i "$deb" >/dev/null 2>&1; then
+          log_ok "$pkg installed (after fix)"
+          okcount=$((okcount+1))
+        else
+          log_err "$pkg install failed (skipping)"
+          failed+=("$pkg")
+          failcount=$((failcount+1))
+        fi
+      else
+        log_err "$pkg install failed and apt-get not found (skipping)"
+        failed+=("$pkg")
+        failcount=$((failcount+1))
+      fi
+    fi
+
+    render_header; render_log_box
+  done
+
+  if (( failcount == 0 )); then
+    log_ok "All deps success (8/8)"
+  else
+    log_warn "${okcount} deps success, ${failcount} deps failed: ${failed[*]}"
+  fi
+  return 0
+}
+
+install_deps_online() {
+  log_info "Installing deps online via apt-get: ${DEPS_LIST[*]}"
+  if ! ensure_cmd apt-get; then
+    log_err "apt-get not found"
+    return 1
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y "${DEPS_LIST[@]}"; then
+    log_ok "Online deps installed"
+    return 0
+  fi
+  log_err "Online deps install failed"
+  return 1
+}
+
+install_paqet_binary_offline() {
+  detect_arch
+  local arch="$ARCH_TAG"
+  if [[ "$arch" != "amd64" && "$arch" != "arm64" ]]; then
+    log_err "Unsupported arch: $(uname -m)"
+    return 1
+  fi
+
+  local primary_tar="/root/p_${arch}.tar.gz"
+
+  local fallback_url=""
+  local fallback_tar=""
+  if [[ "$arch" == "arm64" ]]; then
+    fallback_url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/p_arm64.tar.gz"
+    fallback_tar="/root/p_arm64.tar.gz"
+  else
+    fallback_url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/p_amd64.tar.gz"
+    fallback_tar="/root/p_amd64.tar.gz"
+  fi
+
+  local chosen_tar=""
+  if [[ -f "$primary_tar" ]]; then
+    chosen_tar="$primary_tar"
+    log_ok "Found binary archive: $chosen_tar"
+  else
+    log_warn "Binary archive not found: $primary_tar"
+    log_info "Trying fallback link: $fallback_url"
+    if download_file "$fallback_url" "$fallback_tar"; then
+      chosen_tar="$fallback_tar"
+    else
+      log_err "Binary archive not found and fallback download failed."
+      log_err "Upload a valid archive to /root/ as p_${arch}.tar.gz OR fix the fallback link."
+      return 1
+    fi
+  fi
+
+  if ensure_cmd gzip; then
+    if ! gzip -t "$chosen_tar" >/dev/null 2>&1; then
+      log_warn "Binary archive corrupted/incomplete: $chosen_tar"
+      rm -f "$chosen_tar" 2>/dev/null || true
+      log_info "Re-downloading from fallback: $fallback_url"
+      if download_file "$fallback_url" "$fallback_tar"; then
+        chosen_tar="$fallback_tar"
+        if ! gzip -t "$chosen_tar" >/dev/null 2>&1; then
+          log_err "Fallback archive still corrupted after re-download: $chosen_tar"
+          log_err "Stop. Provide a valid p_${arch}.tar.gz in /root/."
+          return 1
+        fi
+      else
+        log_err "Fallback download failed. Stop."
+        log_err "Provide a valid p_${arch}.tar.gz in /root/."
+        return 1
+      fi
+    fi
+  fi
+
+  local exdir="/root/paqet_bin_extract_${arch}"
+  rm -rf "$exdir" 2>/dev/null || true
+  mkdir -p "$exdir"
+
+  if ! extract_targz_in_place "$chosen_tar" "$exdir"; then
+    log_err "Binary extract failed. Provide a valid archive."
+    return 1
+  fi
+
+  local bin=""
+  bin="$(find "$exdir" -maxdepth 4 -type f -name "p_${arch}" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$bin" ]]; then
+    bin="$(find "$exdir" -maxdepth 6 -type f -iname "paqet*" 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -z "$bin" || ! -f "$bin" ]]; then
+    log_err "Could not find binary inside archive."
+    log_err "Expected: p_${arch} or paqet* inside $chosen_tar"
+    return 1
+  fi
+
+  chmod +x "$bin" >/dev/null 2>&1 || true
+  if cp -f "$bin" /usr/local/bin/paqet; then
+    chmod +x /usr/local/bin/paqet >/dev/null 2>&1 || true
+    log_ok "Installed /usr/local/bin/paqet (offline)"
+    return 0
+  fi
+  log_err "Copy to /usr/local/bin/paqet failed"
+  return 1
+}
+BUNDLE_FILE=""
+BUNDLE_DIR=""
+
+choose_offline_bundle() {
+  local os_tag="$1" mode_tag="$2"
+  BUNDLE_FILE="/root/${os_tag}_${mode_tag}.tar.gz"
+
+  local url=""
+  case "${os_tag}_${mode_tag}" in
+    2404arm64_minimal) url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2404arm64_minimal.tar.gz" ;;
+    2404arm64_full)    url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2404arm64_full.tar.gz" ;;
+    2404amd64_minimal) url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2404amd64_minimal.tar.gz" ;;
+    2404amd64_full)    url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2404amd64_full.tar.gz" ;;
+    2204arm64_minimal) url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2204arm64_minimal.tar.gz" ;;
+    2204arm64_full)    url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2204arm64_full.tar.gz" ;;
+    2204amd64_minimal) url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2204amd64_minimal.tar.gz" ;;
+    2204amd64_full)    url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/2204amd64_full.tar.gz" ;;
+    *)
+      url="https://h4.linklick.ir/e68eee4ccf1abb9e6d4c814d0e6e7009/${os_tag}_${mode_tag}.tar.gz"
+      ;;
+  esac
+
+  if [[ ! -f "$BUNDLE_FILE" ]]; then
+    log_warn "Offline bundle not found: $BUNDLE_FILE"
+    if ! download_file "$url" "$BUNDLE_FILE"; then
+      return 1
+    fi
+  else
+    log_ok "Found bundle: $BUNDLE_FILE"
+  fi
+
+  if ! extract_targz_in_place "$BUNDLE_FILE" "/root"; then
+    return 1
+  fi
+
+  BUNDLE_DIR="/root/${os_tag}_${mode_tag}"
+  if [[ ! -d "$BUNDLE_DIR" ]]; then
+    local top=""
+    top="$(tar -tzf "$BUNDLE_FILE" 2>/dev/null | head -n 1 | cut -d/ -f1 || true)"
+    if [[ -n "$top" && -d "/root/$top" ]]; then
+      BUNDLE_DIR="/root/$top"
+    fi
+  fi
+
+  if [[ ! -d "$BUNDLE_DIR" ]]; then
+    log_err "Extracted directory not found for bundle"
+    return 1
+  fi
+  return 0
+}
+INTERFACE=""
+LOCAL_IP=""
+GATEWAY_IP=""
+GATEWAY_MAC=""
+declare -a INTERFACE_IPV4S=()
+
+select_interface_and_ipv4() {
+  local items=()
+  while read -r iface ip; do
+    [[ -z "$iface" || -z "$ip" ]] && continue
+    items+=("$iface|$ip")
+  done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print $2, a[1]}' | sort -u)
+
+  if ((${#items[@]} == 0)); then return 1; fi
+  if ((${#items[@]} == 1)); then
+    INTERFACE="${items[0]%%|*}"
+    LOCAL_IP="${items[0]##*|}"
+    return 0
+  fi
+
+  echo
+  echo "${c_bold}Multiple interfaces found. Select one:${c_reset}"
+  local idx=1
+  for it in "${items[@]}"; do
+    echo "$idx) ${it%%|*} -> ${it##*|}"
+    idx=$((idx+1))
+  done
+  echo
+  local choice=""
+  read_int_range "Select (1-${#items[@]}): " choice 1 "${#items[@]}" "1"
+  local picked="${items[choice-1]}"
+  INTERFACE="${picked%%|*}"
+  LOCAL_IP="${picked##*|}"
+  return 0
+}
+
+server_network_info() {
+  local BIND_IP="${1:-}"
+
+  if [[ -n "$INTERFACE" && "$INTERFACE" != "not found" ]]; then
+    log_info "Using interface (pre-set): $INTERFACE"
+  elif [[ -n "$BIND_IP" ]]; then
+    INTERFACE="$(ip -o -4 addr show scope global 2>/dev/null | awk -v ip="$BIND_IP" '{ split($4,a,"/"); if (a[1]==ip) {print $2; exit} }')"
+    if [[ -z "$INTERFACE" ]]; then
+      log_err "Could not find interface for BIND_IP=$BIND_IP"
+      exit 1
+    fi
+    LOCAL_IP="$BIND_IP"
+  else
+    if ! select_interface_and_ipv4; then
+      INTERFACE="$(default_interface || true)"
+      if [[ -z "$INTERFACE" ]]; then log_err "Could not determine default route interface"; exit 1; fi
+      LOCAL_IP="$(default_local_ip_for_iface "$INTERFACE" || true)"
+      if [[ -z "$LOCAL_IP" ]]; then log_err "Could not determine LOCAL_IP for $INTERFACE"; exit 1; fi
+    fi
+  fi
+
+  GATEWAY_IP="$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')"
+  [[ -z "$GATEWAY_IP" ]] && { log_err "Could not determine gateway IP"; exit 1; }
+
+  GATEWAY_MAC="$(arp -n "$GATEWAY_IP" 2>/dev/null | awk -v gw="$GATEWAY_IP" '$1==gw {print $3; exit}')"
+  if [[ -z "$GATEWAY_MAC" || "$GATEWAY_MAC" == "<incomplete>" ]]; then
+    ping -c 1 "$GATEWAY_IP" >/dev/null 2>&1 || true
+    GATEWAY_MAC="$(arp -n "$GATEWAY_IP" 2>/dev/null | awk -v gw="$GATEWAY_IP" '$1==gw {print $3; exit}')"
+  fi
+  [[ -z "$GATEWAY_MAC" || "$GATEWAY_MAC" == "<incomplete>" ]] && { log_err "Could not determine gateway MAC"; exit 1; }
+
+  mapfile -t INTERFACE_IPV4S < <(ip -o -4 addr show dev "$INTERFACE" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
+  [[ -z "$LOCAL_IP" ]] && LOCAL_IP="${INTERFACE_IPV4S[0]:-}"
+  [[ -z "$LOCAL_IP" ]] && { log_err "LOCAL_IP is empty"; exit 1; }
+
+  log_ok "Network info: IFACE=$INTERFACE LOCAL_IP=$LOCAL_IP GW_IP=$GATEWAY_IP GW_MAC=$GATEWAY_MAC"
+}
+
+iptables_rule_add_once() {
+  local table="$1"; shift
+  local chain="$1"; shift
+  if iptables -t "$table" -C "$chain" "$@" >/dev/null 2>&1; then
+    log_info "iptables rule exists ($table/$chain): $*"
+  else
+    if iptables -t "$table" -A "$chain" "$@"; then
+      log_ok "iptables rule added ($table/$chain): $*"
+    else
+      log_err "iptables add failed ($table/$chain): $*"
+    fi
+  fi
+}
+
+firewall_setup() {
+  local port="$1"
+  if [[ "$port" == "80" || "$port" == "443" ]]; then
+    log_warn "Port $port is sensitive (80/443). This can be risky."
+  fi
+  iptables_rule_add_once raw PREROUTING -p tcp --dport "$port" -j NOTRACK
+  iptables_rule_add_once raw OUTPUT -p tcp --sport "$port" -j NOTRACK
+  iptables_rule_add_once mangle OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+
+  detect_distro
+  if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
+    mkdir -p /etc/iptables
+    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+      log_warn "iptables-persistent not installed. Installing..."
+      if ensure_cmd apt-get; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1 || true
+      fi
+    fi
+    if iptables-save > /etc/iptables/rules.v4; then
+      log_ok "Saved iptables rules to /etc/iptables/rules.v4"
+    else
+      log_err "Failed to save iptables rules"
+    fi
+  else
+    log_warn "Non Debian/Ubuntu distro: persistence not configured."
+  fi
+}
+
+KCP_NODELAY="1"
+KCP_INTERVAL="10"
+KCP_RESEND="2"
+KCP_NC="1"
+KCP_RCVWND="2048"
+KCP_SNDWND="2048"
+KCP_SMUXBUF="4194304"
+KCP_STREAMBUF="2097152"
+
+kcp_apply_preset() {
+  local mode="$1" role="$2"
+  KCP_NODELAY="1"
+  KCP_NC="1"
+
+  if [[ "$mode" == "fast" ]]; then
+    KCP_INTERVAL="10"
+    KCP_RESEND="2"
+    KCP_SMUXBUF="4194304"
+    KCP_STREAMBUF="2097152"
+    if [[ "$role" == "server" ]]; then KCP_RCVWND="2048"; KCP_SNDWND="2048"; else KCP_RCVWND="1024"; KCP_SNDWND="1024"; fi
+  elif [[ "$mode" == "fast2" ]]; then
+    KCP_INTERVAL="8"
+    KCP_RESEND="2"
+    if [[ "$role" == "server" ]]; then
+      KCP_RCVWND="4096"; KCP_SNDWND="4096"
+      KCP_SMUXBUF="8388608"; KCP_STREAMBUF="4194304"
+    else
+      KCP_RCVWND="2048"; KCP_SNDWND="2048"
+      KCP_SMUXBUF="6291456"; KCP_STREAMBUF="3145728"
+    fi
+  elif [[ "$mode" == "fast3" ]]; then
+    KCP_INTERVAL="6"
+    KCP_RESEND="1"
+    if [[ "$role" == "server" ]]; then
+      KCP_RCVWND="8192"; KCP_SNDWND="8192"
+      KCP_SMUXBUF="16777216"; KCP_STREAMBUF="8388608"
+    else
+      KCP_RCVWND="4096"; KCP_SNDWND="4096"
+      KCP_SMUXBUF="12582912"; KCP_STREAMBUF="6291456"
+    fi
+  fi
+}
+
+yaml_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+validate_config_file() {
+  local config_file="$1"
+  if [[ ! -f "$config_file" ]]; then
+    log_err "Config not found: $config_file"
+    return 1
+  fi
+  if grep -q "^role:" "$config_file" && (grep -q "\"client\"" "$config_file" || grep -q "\"server\"" "$config_file"); then
+    log_ok "Configuration file validated: $config_file"
+    return 0
+  fi
+  log_err "Invalid configuration: role not properly set in $config_file"
+  return 1
+}
+
+write_server_yaml() {
+  local tunnel_id="$1" listen_port="$2" conn_count="$3" kcp_mode="$4" mtu="$5" key="$6"
+  local config_dir="/etc/paqet"
+  local config_file="${config_dir}/paqet-server-${tunnel_id}.yaml"
+  mkdir -p "$config_dir"
+
+  {
+    echo "role: \"server\""
+    echo
+    echo "log:"
+    echo "  level: \"info\""
+    echo
+    echo "listen:"
+    echo "  addr: \":${listen_port}\""
+    echo
+    echo "network:"
+    echo "  interface: \"$(yaml_escape "$INTERFACE")\""
+    echo "  ipv4:"
+    echo "    addr: \"$(yaml_escape "$LOCAL_IP"):${listen_port}\""
+    echo "    router_mac: \"$(yaml_escape "$GATEWAY_MAC")\""
+    echo "  tcp:"
+    echo "    local_flag: [\"PA\"]"
+    echo "    remote_flag: [\"PA\"]"
+    echo "  pcap:"
+    echo "    sockbuf: 8388608"
+    echo
+    echo "transport:"
+    echo "  protocol: \"kcp\""
+    echo "  conn: ${conn_count}"
+    echo "  kcp:"
+    echo "    mode: \"$(yaml_escape "$kcp_mode")\""
+    echo "    mtu: ${mtu}"
+    echo "    nodelay: ${KCP_NODELAY}"
+    echo "    interval: ${KCP_INTERVAL}"
+    echo "    resend: ${KCP_RESEND}"
+    echo "    nc: ${KCP_NC}"
+    echo "    rcvwnd: ${KCP_RCVWND}"
+    echo "    sndwnd: ${KCP_SNDWND}"
+    echo "    block: \"aes\""
+    echo "    key: \"$(yaml_escape "$key")\""
+    echo "    smuxbuf: ${KCP_SMUXBUF}"
+    echo "    streambuf: ${KCP_STREAMBUF}"
+  } > "$config_file"
+
+  chmod 600 "$config_file"
+  log_ok "Server config created: $config_file"
+  echo "$config_file"
+}
+
+write_client_yaml() {
+  local tunnel_id="$1" server_ip="$2" server_port="$3" conn_count="$4" kcp_mode="$5" mtu="$6" key="$7" forwards_yaml="$8"
+  local config_dir="/etc/paqet"
+  local config_file="${config_dir}/paqet-client-${tunnel_id}.yaml"
+  mkdir -p "$config_dir"
+
+  {
+    echo "role: \"client\""
+    echo
+    echo "log:"
+    echo "  level: \"info\""
+    echo
+    echo "forward:"
+    echo "$forwards_yaml"
+    echo
+    echo "network:"
+    echo "  interface: \"$(yaml_escape "$INTERFACE")\""
+    echo "  ipv4:"
+    echo "    addr: \"$(yaml_escape "$LOCAL_IP"):0\""
+    echo "    router_mac: \"$(yaml_escape "$GATEWAY_MAC")\""
+    echo "  tcp:"
+    echo "    local_flag: [\"PA\"]"
+    echo "    remote_flag: [\"PA\"]"
+    echo "  pcap:"
+    echo "    sockbuf: 4194304"
+    echo
+    echo "server:"
+    echo "  addr: \"$(yaml_escape "$server_ip"):${server_port}\""
+    echo
+    echo "transport:"
+    echo "  protocol: \"kcp\""
+    echo "  conn: ${conn_count}"
+    echo "  kcp:"
+    echo "    mode: \"$(yaml_escape "$kcp_mode")\""
+    echo "    mtu: ${mtu}"
+    echo "    nodelay: ${KCP_NODELAY}"
+    echo "    interval: ${KCP_INTERVAL}"
+    echo "    resend: ${KCP_RESEND}"
+    echo "    nc: ${KCP_NC}"
+    echo "    rcvwnd: ${KCP_RCVWND}"
+    echo "    sndwnd: ${KCP_SNDWND}"
+    echo "    block: \"aes\""
+    echo "    key: \"$(yaml_escape "$key")\""
+    echo "    smuxbuf: ${KCP_SMUXBUF}"
+    echo "    streambuf: ${KCP_STREAMBUF}"
+  } > "$config_file"
+
+  chmod 600 "$config_file"
+  log_ok "Client config created: $config_file"
+  echo "$config_file"
+}
+
+write_systemd_service_file() {
+  local role="$1" tunnel_id="$2" config_file="$3"
+  local service_name="paqet-${role}-${tunnel_id}"
+  local service_file="/etc/systemd/system/${service_name}.service"
+  local paqet_bin="/usr/local/bin/paqet"
+  local workdir="/etc/paqet"
+
+  {
+    echo "[Unit]"
+    echo "Description=Paqet Tunnel (${role}-${tunnel_id})"
+    echo "After=network.target"
+    echo
+    echo "[Service]"
+    echo "Type=simple"
+    echo "User=root"
+    echo "WorkingDirectory=${workdir}"
+    echo "ExecStart=${paqet_bin} run -c ${config_file}"
+    echo "Restart=always"
+    echo "RestartSec=10"
+    echo "RuntimeMaxSec=3600"
+    echo "StandardOutput=journal"
+    echo "StandardError=journal"
+    echo "SyslogIdentifier=${service_name}"
+    echo
+    echo "[Install]"
+    echo "WantedBy=multi-user.target"
+  } > "$service_file"
+
+  chmod 644 "$service_file"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log_ok "Service file created: $service_file"
+  echo "$service_name"
+}
+
+enable_start_and_show_status() {
+  local service_name="$1"
+
+  if ! ensure_cmd systemctl; then
+    log_err "systemctl not found"
+    return 1
+  fi
+
+  log_info "Enabling & starting service: $service_name"
+  if systemctl enable --now "$service_name" >/dev/null 2>&1; then
+    log_ok "Service started: $service_name"
+  else
+    log_err "Failed to enable/start service: $service_name"
+  fi
+
+  echo
+  hr "="
+  echo "${c_bold}systemctl status ${service_name}${c_reset}"
+  hr "-"
+  systemctl status "$service_name" --no-pager || true
+  hr "="
+  echo
+}
+
+parse_forward_mappings() {
+  local input="$1" server_ip="$2"
+  local yaml=""
+  local part
+  for part in $input; do
+    part="${part// /}"
+    [[ -z "$part" ]] && continue
+    if ! [[ "$part" =~ ^[0-9]+=[0-9]+$ ]]; then
+      log_warn "Invalid mapping skipped: $part (expected local=target)"
+      continue
+    fi
+    local l="${part%=*}"
+    local t="${part#*=}"
+    if ! normalize_port "$l" >/dev/null 2>&1 || ! normalize_port "$t" >/dev/null 2>&1; then
+      log_warn "Invalid ports skipped: $part"
+      continue
+    fi
+    yaml+="  - listen: \":${l}\"\n"
+    yaml+="    target: \"${server_ip}:${t}\"\n"
+    yaml+="    protocol: \"tcp\"\n"
+  done
+  [[ -z "$yaml" ]] && echo "" || printf "%b" "$yaml"
+}
+
+menu_install_core_and_deps() {
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}1) install Core and Deps${c_reset}"
+    echo
+    echo "1) offline mode"
+    echo "2) online mode"
+    echo "3) back"
+    echo
+    local ch=""
+    if ! ask_choice_once "Select: " ch 1 2 3; then
+      continue
+    fi
+    case "$ch" in
+      1) install_offline_flow ;;
+      2) install_online_flow ;;
+      3) return 0 ;;
+    esac
+  done
+}
+
+install_offline_flow() {
+  while true; do
+    render_header; render_log_box
+    detect_distro; detect_arch
+    log_info "your system is ${DISTRO} ${DISTRO_VER} ${ARCH_TAG}"
+    echo "your system is ${DISTRO} ${DISTRO_VER} ${ARCH_TAG}"
+    echo
+    echo "1) ubuntu 24.04 AMD64"
+    echo "2) ubuntu 22.04 AMD64"
+    echo "3) ubuntu 24.04 ARM64"
+    echo "4) ubuntu 22.04 ARM64"
+    echo "5) back"
+    echo
+    local os=""
+    if ! ask_choice_once "Select OS: " os 1 2 3 4 5; then
+      continue
+    fi
+    [[ "$os" == "5" ]] && return 0
+
+    local os_tag=""
+    case "$os" in
+      1) os_tag="2404amd64" ;;
+      2) os_tag="2204amd64" ;;
+      3) os_tag="2404arm64" ;;
+      4) os_tag="2204arm64" ;;
+    esac
+
+    while true; do
+      render_header; render_log_box
+      echo "${c_bold}Install Type${c_reset}"
+      echo
+      echo "1) minimal install"
+      echo "2) full install"
+      echo "3) back"
+      echo
+      local it=""
+      if ! ask_choice_once "Select: " it 1 2 3; then
+        continue
+      fi
+      [[ "$it" == "3" ]] && break
+
+      local mode_tag=""
+      [[ "$it" == "1" ]] && mode_tag="minimal" || mode_tag="full"
+
+      if ! choose_offline_bundle "$os_tag" "$mode_tag"; then
+        log_warn "Offline bundle not available. Returning."
+        pause_enter
+        return 0
+      fi
+
+      install_deps_offline_from_dir "$BUNDLE_DIR"
+      render_header; render_log_box
+
+      if ! install_paqet_binary_offline; then
+        log_warn "Binary install failed (offline). Returning."
+        pause_enter
+        return 0
+      fi
+
+      log_ok "Offline install flow finished."
+      pause_enter
+      return 0
+    done
+  done
+}
+
+install_online_flow() {
+  render_header; render_log_box
+  log_info "Online mode selected"
+  if ! install_deps_online; then pause_enter; return 0; fi
+  render_header; render_log_box
+  if ! install_paqet_binary_online; then pause_enter; return 0; fi
+  log_ok "Online install flow finished."
+  pause_enter
+}
+
+menu_setup_server() {
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}2) Setup Server${c_reset}"
+    echo
+
+    local TUN_ID SERVER_PORT CONN_COUNT MTU
+    local KCP_CHOICE KCP_MODE
+    local iface_guess
+    iface_guess="$(default_interface || true)"
+    [[ -z "$iface_guess" ]] && iface_guess="not found"
+
+    read_int_range "Tunnel id (1-999): " TUN_ID 1 999
+    read_line "listen port (default 8484): " SERVER_PORT "8484"
+    SERVER_PORT="$(normalize_port "$SERVER_PORT" || true)"
+    [[ -z "$SERVER_PORT" ]] && SERVER_PORT="8484"
+
+    read_line "connection count (default 4): " CONN_COUNT "4"
+    if ! [[ "$CONN_COUNT" =~ ^[0-9]+$ ]] || (( CONN_COUNT < 1 || CONN_COUNT > 256 )); then
+      CONN_COUNT="4"
+    fi
+
+    while true; do
+      render_header; render_log_box
+      echo "${c_bold}KCP mode${c_reset}"
+      echo "1) fast"
+      echo "2) fast2"
+      echo "3) fast3"
+      echo "4) manual"
+      echo
+      if ! ask_choice_once "Select: " KCP_CHOICE 1 2 3 4; then
+        continue
+      fi
+      break
+    done
+    case "$KCP_CHOICE" in
+      1) KCP_MODE="fast" ;;
+      2) KCP_MODE="fast2" ;;
+      3) KCP_MODE="fast3" ;;
+      4) KCP_MODE="manual" ;;
+    esac
+
+    read_line "set mtu (default 1300): " MTU "1300"
+    if ! [[ "$MTU" =~ ^[0-9]+$ ]] || (( MTU < 50 || MTU > 1500 )); then
+      MTU="1300"
+    fi
+
+    read_line "interface (your interface is ${iface_guess}): " INTERFACE "${iface_guess}"
+    [[ "$INTERFACE" == "not found" ]] && INTERFACE=""
+
+    if [[ "$KCP_MODE" == "manual" ]]; then
+      render_header; render_log_box
+      log_info "Manual KCP parameters"
+      read_line "KCP_NODELAY (default 1): " KCP_NODELAY "1"
+      read_line "KCP_INTERVAL ms (default 10): " KCP_INTERVAL "10"
+      read_line "KCP_RESEND (default 2): " KCP_RESEND "2"
+      read_line "KCP_NC (default 1): " KCP_NC "1"
+      read_line "KCP_RCVWND (default 2048): " KCP_RCVWND "2048"
+      read_line "KCP_SNDWND (default 2048): " KCP_SNDWND "2048"
+      read_line "KCP_SMUXBUF (default 4194304): " KCP_SMUXBUF "4194304"
+      read_line "KCP_STREAMBUF (default 2097152): " KCP_STREAMBUF "2097152"
+    else
+      kcp_apply_preset "$KCP_MODE" "server"
+      log_info "Applied KCP preset for server: $KCP_MODE"
+    fi
+
+    local KEY=""
+    if ensure_cmd openssl; then
+      KEY="$(openssl rand -base64 32 | tr -d '\n' | tr -d '=' | tr '/+' 'ab')"
+    else
+      KEY="$(head -c 48 /dev/urandom | base64 | tr -d '\n' | tr -d '=' | tr '/+' 'ab')"
+    fi
+
+    render_header; render_log_box
+    echo "${c_bold}${c_green}YOUR KEY (copy it)${c_reset}"
+    hr "-"
+    echo "${c_bold}${KEY}${c_reset}"
+    hr "-"
+    echo
+    read -r -p "Press Enter after you copied the key to start setup..." _
+
+    render_header; render_log_box
+    log_info "Collecting server network info..."
+    server_network_info ""
+
+    local cfg=""
+    cfg="$(write_server_yaml "$TUN_ID" "$SERVER_PORT" "$CONN_COUNT" "$KCP_MODE" "$MTU" "$KEY")"
+
+    if ! validate_config_file "$cfg"; then
+      log_err "Config validation failed. Returning."
+      pause_enter
+      return 0
+    fi
+
+    local svc=""
+    svc="$(write_systemd_service_file "server" "$TUN_ID" "$cfg")"
+
+    while true; do
+      render_header; render_log_box
+      echo "${c_bold}Firewall setup${c_reset}"
+      echo "1) Apply firewall rules for port ${SERVER_PORT}"
+      echo "2) Skip"
+      echo
+      local fw=""
+      if ! ask_choice_once "Select: " fw 1 2; then
+        continue
+      fi
+      if [[ "$fw" == "1" ]]; then firewall_setup "$SERVER_PORT"; else log_info "Firewall setup skipped"; fi
+      break
+    done
+
+    while true; do
+      render_header; render_log_box
+      echo "${c_bold}Service Deployment${c_reset}"
+      echo "1) Enable & Start service now"
+      echo "2) Skip (manual)"
+      echo
+      local sopt=""
+      if ! ask_choice_once "Select: " sopt 1 2; then
+        continue
+      fi
+      if [[ "$sopt" == "1" ]]; then
+        enable_start_and_show_status "$svc"
+      else
+        log_info "Skipped start. You can run: systemctl enable --now $svc"
+      fi
+      break
+    done
+
+    pause_enter
+    return 0
+  done
+}
+
+menu_setup_client() {
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}3) Setup Client${c_reset}"
+    echo
+
+    local TUN_ID SERVER_IP SERVER_PORT CONN_COUNT MTU
+    local KCP_CHOICE KCP_MODE KEY
+    local iface_guess
+    iface_guess="$(default_interface || true)"
+    [[ -z "$iface_guess" ]] && iface_guess="not found"
+
+    read_int_range "Tunnel ID (1-999): " TUN_ID 1 999
+
+    read_ipv4_loop "Kharej Server ip: " SERVER_IP
+
+    read_line "Tun(kharej listen on) PORT (default 8484): " SERVER_PORT "8484"
+    SERVER_PORT="$(normalize_port "$SERVER_PORT" || true)"
+    [[ -z "$SERVER_PORT" ]] && SERVER_PORT="8484"
+
+    local MAPS=""
+    read_line "map your Port Forwarding (example 8443=443 8080=8880): " MAPS
+    local FORWARDS_YAML=""
+    while true; do
+      FORWARDS_YAML="$(parse_forward_mappings "$MAPS" "$SERVER_IP")"
+      if [[ -n "$FORWARDS_YAML" ]]; then break; fi
+      log_warn "No valid mappings. Try again."
+      render_header; render_log_box
+      read_line "map your Port Forwarding (example 8443=443 8080=8880): " MAPS
+    done
+
+    read_line "connection count (default 4): " CONN_COUNT "4"
+    if ! [[ "$CONN_COUNT" =~ ^[0-9]+$ ]] || (( CONN_COUNT < 1 || CONN_COUNT > 256 )); then
+      CONN_COUNT="4"
+    fi
+
+    while true; do
+      render_header; render_log_box
+      echo "${c_bold}KCP mode${c_reset}"
+      echo "1) fast"
+      echo "2) fast2"
+      echo "3) fast3"
+      echo "4) manual"
+      echo
+      if ! ask_choice_once "Select: " KCP_CHOICE 1 2 3 4; then
+        continue
+      fi
+      break
+    done
+    case "$KCP_CHOICE" in
+      1) KCP_MODE="fast" ;;
+      2) KCP_MODE="fast2" ;;
+      3) KCP_MODE="fast3" ;;
+      4) KCP_MODE="manual" ;;
+    esac
+
+    read_line "set mtu (default 1300): " MTU "1300"
+    if ! [[ "$MTU" =~ ^[0-9]+$ ]] || (( MTU < 50 || MTU > 1500 )); then
+      MTU="1300"
+    fi
+
+    read_line "interface (your interface is ${iface_guess}): " INTERFACE "${iface_guess}"
+    [[ "$INTERFACE" == "not found" ]] && INTERFACE=""
+
+    read_line "input your key: " KEY
+    while [[ -z "$KEY" ]]; do
+      log_warn "Key cannot be empty"
+      render_header; render_log_box
+      read_line "input your key: " KEY
+    done
+
+    if [[ "$KCP_MODE" == "manual" ]]; then
+      render_header; render_log_box
+      log_info "Manual KCP parameters"
+      read_line "KCP_NODELAY (default 1): " KCP_NODELAY "1"
+      read_line "KCP_INTERVAL ms (default 10): " KCP_INTERVAL "10"
+      read_line "KCP_RESEND (default 2): " KCP_RESEND "2"
+      read_line "KCP_NC (default 1): " KCP_NC "1"
+      read_line "KCP_RCVWND (default 1024): " KCP_RCVWND "1024"
+      read_line "KCP_SNDWND (default 1024): " KCP_SNDWND "1024"
+      read_line "KCP_SMUXBUF (default 4194304): " KCP_SMUXBUF "4194304"
+      read_line "KCP_STREAMBUF (default 2097152): " KCP_STREAMBUF "2097152"
+    else
+      kcp_apply_preset "$KCP_MODE" "client"
+      log_info "Applied KCP preset for client: $KCP_MODE"
+    fi
+
+    render_header; render_log_box
+    echo "${c_bold}Summary${c_reset}"
+    echo "Tunnel ID : $TUN_ID"
+    echo "Server    : ${SERVER_IP}:${SERVER_PORT}"
+    echo "Conn      : $CONN_COUNT"
+    echo "KCP mode  : $KCP_MODE"
+    echo "MTU       : $MTU"
+    echo "Interface : ${INTERFACE:-auto}"
+    echo
+    read -r -p "Press Enter to deploy client config & service..." _
+
+    render_header; render_log_box
+    log_info "Collecting client network info..."
+    server_network_info ""
+
+    local cfg=""
+    cfg="$(write_client_yaml "$TUN_ID" "$SERVER_IP" "$SERVER_PORT" "$CONN_COUNT" "$KCP_MODE" "$MTU" "$KEY" "$FORWARDS_YAML")"
+
+    if ! validate_config_file "$cfg"; then
+      log_err "Config validation failed. Returning."
+      pause_enter
+      return 0
+    fi
+
+    local svc=""
+    svc="$(write_systemd_service_file "client" "$TUN_ID" "$cfg")"
+
+    while true; do
+      render_header; render_log_box
+      echo "${c_bold}Service Deployment${c_reset}"
+      echo "1) Enable & Start service now"
+      echo "2) Skip (manual)"
+      echo
+      local sopt=""
+      if ! ask_choice_once "Select: " sopt 1 2; then
+        continue
+      fi
+      if [[ "$sopt" == "1" ]]; then
+        enable_start_and_show_status "$svc"
+      else
+        log_info "Skipped start. You can run: systemctl enable --now $svc"
+      fi
+      break
+    done
+
+    pause_enter
+    return 0
+  done
+}
+
+
+show_status_box() {
+  local service_name="$1"
+  echo
+  hr "="
+  echo "${c_bold}systemctl status ${service_name}${c_reset}"
+  hr "-"
+  systemctl status "$service_name" --no-pager || true
+  hr "="
+  echo
+}
+
+svc_stop_disable() {
+  local s="$1"
+  if ! ensure_cmd systemctl; then log_err "systemctl not found"; return 1; fi
+  log_info "Stopping & disabling: $s"
+  systemctl disable --now "$s" >/dev/null 2>&1 || true
+  log_ok "Stopped/disabled (best-effort): $s"
+  show_status_box "$s"
+}
+
+svc_start_enable() {
+  local s="$1"
+  enable_start_and_show_status "$s"
+}
+
+svc_restart() {
+  local s="$1"
+  if ! ensure_cmd systemctl; then log_err "systemctl not found"; return 1; fi
+  log_info "Restarting: $s"
+  systemctl restart "$s" >/dev/null 2>&1 || true
+  log_ok "Restart issued: $s"
+  show_status_box "$s"
+}
+
+svc_clean_one() {
+  local s="$1"
+  local unit="/etc/systemd/system/${s}.service"
+  local cfg="/etc/paqet/${s}.yaml"
+  log_info "Cleaning service: $s"
+  systemctl disable --now "$s" >/dev/null 2>&1 || true
+  rm -f "$unit" >/dev/null 2>&1 || true
+  rm -f "$cfg" >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log_ok "Cleaned: $s (service+yaml removed)"
+}
+
+list_paqet_services() {
+  if ! ensure_cmd systemctl; then return 1; fi
+  systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+    | awk '{print $1}' \
+    | sed 's/\.service$//' \
+    | grep -E '^paqet-(client|server)-[0-9]+$' \
+    | sort -V
+}
+
+cfg_path_from_service() {
+  local s="$1"
+  echo "/etc/paqet/${s}.yaml"
+}
+
+extract_first_number_field() {
+  local cfg="$1" key="$2" def="${3:-}"
+  local out=""
+  out="$(awk -v k="$key" '
+    $1==k":" {
+      gsub(/[^0-9]/,"",$0);
+      if ($0!="") {print $0; exit}
+    }' "$cfg" 2>/dev/null || true)"
+  [[ -z "$out" ]] && out="$def"
+  echo "$out"
+}
+
+extract_first_quoted_field() {
+  local cfg="$1" key="$2" def="${3:-}"
+  local out=""
+  out="$(awk -F'"' -v k="$key" '
+    $1 ~ "^[[:space:]]*"k":[[:space:]]*$" {next}
+    $0 ~ "^[[:space:]]*"k":[[:space:]]*\"" {print $2; exit}
+  ' "$cfg" 2>/dev/null || true)"
+  [[ -z "$out" ]] && out="$def"
+  echo "$out"
+}
+
+client_extract_server_ip_from_cfg() {
+  local cfg="$1"
+  awk -F'"' '/^[[:space:]]*addr:[[:space:]]*"/ {print $2}' "$cfg" 2>/dev/null \
+    | awk -F':' '{print $1; exit}'
+}
+
+client_extract_server_port_from_cfg() {
+  local cfg="$1"
+  awk -F'"' '/^[[:space:]]*addr:[[:space:]]*"/ {print $2}' "$cfg" 2>/dev/null \
+    | awk -F':' '{print $2; exit}'
+}
+
+client_read_forward_mappings() {
+  local cfg="$1"
+  awk '
+    BEGIN{inF=0; listen=""; target=""; proto=""}
+    /^[[:space:]]*forward:[[:space:]]*$/ {inF=1; next}
+    inF && /^[[:space:]]*network:[[:space:]]*$/ {exit}
+    inF {
+      if ($0 ~ /^[[:space:]]*-[[:space:]]*listen:[[:space:]]*"/) {
+        gsub(/.*listen:[[:space:]]*"/,""); gsub(/".*/,"");
+        gsub(/^:/,"");
+        listen=$0
+      } else if ($0 ~ /^[[:space:]]*target:[[:space:]]*"/) {
+        gsub(/.*target:[[:space:]]*"/,""); gsub(/".*/,"");
+        target=$0
+      } else if ($0 ~ /^[[:space:]]*protocol:[[:space:]]*"/) {
+        gsub(/.*protocol:[[:space:]]*"/,""); gsub(/".*/,"");
+        proto=$0
+      }
+      if (listen!="" && target!="" && proto!="") {
+        print listen "=" target
+        listen=""; target=""; proto=""
+      }
+    }
+  ' "$cfg" 2>/dev/null
+}
+
+client_write_forward_block_into_cfg() {
+  local cfg="$1"
+  shift
+  local mappings=("$@")
+  local tmp="/tmp/paqet_cfg.$$"
+
+  awk '
+    BEGIN{inF=0}
+    /^[[:space:]]*forward:[[:space:]]*$/ {
+      print $0
+      inF=1
+      next
+    }
+    inF && /^[[:space:]]*network:[[:space:]]*$/ {exit}
+    !inF {print}
+  ' "$cfg" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+  {
+    for m in "${mappings[@]}"; do
+      local lp="${m%%=*}"
+      local tgt="${m#*=}"
+      echo "  - listen: \":${lp}\""
+      echo "    target: \"${tgt}\""
+      echo "    protocol: \"tcp\""
+    done
+    echo
+    awk '
+      BEGIN{inF=0; started=0}
+      /^[[:space:]]*forward:[[:space:]]*$/ {inF=1; next}
+      inF && /^[[:space:]]*network:[[:space:]]*$/ {started=1}
+      started {print}
+    ' "$cfg"
+  } >> "$tmp" 2>/dev/null
+
+  if [[ -s "$tmp" ]]; then
+    cp -f "$tmp" "$cfg"
+    rm -f "$tmp" >/dev/null 2>&1 || true
+    chmod 600 "$cfg" >/dev/null 2>&1 || true
+    log_ok "Forward mappings updated in: $cfg"
+    return 0
+  fi
+  rm -f "$tmp" >/dev/null 2>&1 || true
+  return 1
+}
+
+parse_one_mapping_input() {
+  local in="$1"
+  in="${in// /}"
+  local lp="" tp=""
+  if [[ "$in" =~ ^[0-9]+=[0-9]+$ ]]; then
+    lp="${in%=*}"
+    tp="${in#*=}"
+  else
+    lp="$in"
+    tp=""
+  fi
+  lp="$(normalize_port "$lp" 2>/dev/null || true)"
+  [[ -z "$lp" ]] && return 1
+  if [[ -n "$tp" ]]; then
+    tp="$(normalize_port "$tp" 2>/dev/null || true)"
+    [[ -z "$tp" ]] && return 1
+    printf '%s %s' "$lp" "$tp"
+    return 0
+  fi
+  printf '%s' "$lp"
+  return 0
+}
+
+client_manage_forward_mapping() {
+  local service_name="$1"
+  local cfg; cfg="$(cfg_path_from_service "$service_name")"
+  if [[ ! -f "$cfg" ]]; then
+    log_err "Config not found: $cfg"
+    pause_enter
+    return 0
+  fi
+
+  local maps=()
+  mapfile -t maps < <(client_read_forward_mappings "$cfg" || true)
+
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}Forward Port Mapping: ${service_name}${c_reset}"
+    echo
+    local idx=1
+    for m in "${maps[@]}"; do
+      local lp="${m%%=*}"
+      local tgt="${m#*=}"
+      local tp="${tgt##*:}"
+      echo "${idx}) ${lp}=${tp}"
+      idx=$((idx+1))
+    done
+    echo "${idx}) add new port"
+    echo "$((idx+1))) back"
+    echo
+
+    local ch=""
+    local allowed=()
+    local i
+    for ((i=1;i<=idx+1;i++)); do allowed+=("$i"); done
+
+    if ! ask_choice_once "Select: " ch "${allowed[@]}"; then
+      continue
+    fi
+
+    if [[ "$ch" == "$((idx+1))" ]]; then
+      return 0
+    fi
+
+    if [[ "$ch" == "$idx" ]]; then
+      local srv_ip; srv_ip="$(client_extract_server_ip_from_cfg "$cfg")"
+      [[ -z "$srv_ip" ]] && srv_ip="127.0.0.1"
+
+      local in lp tp
+      read_line "New listen port (or listen=target): " in
+      in="${in// /}"
+      if ! lp_tp="$(parse_one_mapping_input "$in" 2>/dev/null || true)"; then
+        log_warn "Invalid listen/format"
+        pause_enter
+        continue
+      fi
+
+      lp="${lp_tp%% *}"
+      tp="${lp_tp#* }"
+      if [[ "$lp_tp" != *" "* ]]; then
+        read_line "New target port: " tp
+        tp="$(normalize_port "$tp" || true)"
+        if [[ -z "$tp" ]]; then
+          log_warn "Invalid target port"
+          pause_enter
+          continue
+        fi
+      fi
+
+      maps+=("${lp}=${srv_ip}:${tp}")
+      client_write_forward_block_into_cfg "$cfg" "${maps[@]}" || log_err "Failed to write mappings"
+      svc_restart "$service_name"
+      pause_enter
+      return 0
+    fi
+
+    local sel_index=$((ch-1))
+    local selected="${maps[$sel_index]}"
+    local lp_old="${selected%%=*}"
+    local tgt_old="${selected#*=}"
+    local tp_old="${tgt_old##*:}"
+    local host_old="${tgt_old%:*}"
+
+    while true; do
+      render_header; render_log_box
+      echo "${c_bold}Selected: ${lp_old}=${tp_old}${c_reset}"
+      echo
+      echo "1) remove"
+      echo "2) change"
+      echo "3) back"
+      echo
+      local op=""
+      if ! ask_choice_once "Select: " op 1 2 3; then
+        continue
+      fi
+      if [[ "$op" == "3" ]]; then
+        break
+      elif [[ "$op" == "1" ]]; then
+        unset 'maps[sel_index]'
+        local newmaps=()
+        for m in "${maps[@]}"; do [[ -n "$m" ]] && newmaps+=("$m"); done
+        maps=("${newmaps[@]}")
+        client_write_forward_block_into_cfg "$cfg" "${maps[@]}" || log_err "Failed to write mappings"
+        svc_restart "$service_name"
+        pause_enter
+        return 0
+      elif [[ "$op" == "2" ]]; then
+        local lp_new tp_new
+        read_line "New listen port (default ${lp_old}): " lp_new "$lp_old"
+        lp_new="$(normalize_port "$lp_new" || true)"
+        if [[ -z "$lp_new" ]]; then
+          log_warn "Invalid listen port"
+          pause_enter
+          continue
+        fi
+
+        read_line "New target port (default ${tp_old}): " tp_new "$tp_old"
+        tp_new="$(normalize_port "$tp_new" || true)"
+        if [[ -z "$tp_new" ]]; then
+          log_warn "Invalid target port"
+          pause_enter
+          continue
+        fi
+
+        maps[$sel_index]="${lp_new}=${host_old}:${tp_new}"
+        client_write_forward_block_into_cfg "$cfg" "${maps[@]}" || log_err "Failed to write mappings"
+        svc_restart "$service_name"
+        pause_enter
+        return 0
+      fi
+    done
+  done
+}
+
+client_rewrite_full_config_from_manage() {
+  local service_name="$1"
+  local cfg; cfg="$(cfg_path_from_service "$service_name")"
+  if [[ ! -f "$cfg" ]]; then
+    log_err "Config not found: $cfg"
+    pause_enter
+    return 0
+  fi
+
+  local def_server_ip def_server_port def_conn def_mode def_mtu def_key
+  def_server_ip="$(client_extract_server_ip_from_cfg "$cfg")"
+  def_server_port="$(client_extract_server_port_from_cfg "$cfg")"
+  def_conn="$(extract_first_number_field "$cfg" "conn" "4")"
+  def_mode="$(extract_first_quoted_field "$cfg" "mode" "fast")"
+  def_mtu="$(extract_first_number_field "$cfg" "mtu" "1300")"
+  def_key="$(extract_first_quoted_field "$cfg" "key" "")"
+
+  [[ -z "$def_server_port" ]] && def_server_port="8484"
+  [[ -z "$def_conn" ]] && def_conn="4"
+  [[ -z "$def_mode" ]] && def_mode="fast"
+  [[ -z "$def_mtu" ]] && def_mtu="1300"
+
+  local tunnel_id="${service_name##*-}"
+
+  render_header; render_log_box
+  log_info "Rewrite client config for: $service_name"
+  echo "${c_bold}Rewrite Client Config${c_reset}"
+  echo
+
+  local SERVER_IP SERVER_PORT CONN_COUNT MTU KEY
+  local KCP_CHOICE KCP_MODE
+
+  read_ipv4_loop "Kharej Server ip: " SERVER_IP "$def_server_ip"
+
+  read_line "Tun(kharej listen on) PORT (default ${def_server_port}): " SERVER_PORT "$def_server_port"
+  SERVER_PORT="$(normalize_port "$SERVER_PORT" || true)"
+  [[ -z "$SERVER_PORT" ]] && SERVER_PORT="$def_server_port"
+
+  local MAPS=""
+  read_line "map your Port Forwarding (example 8443=443 8080=8880): " MAPS
+  local FORWARDS_YAML=""
+  while true; do
+    FORWARDS_YAML="$(parse_forward_mappings "$MAPS" "$SERVER_IP")"
+    if [[ -n "$FORWARDS_YAML" ]]; then break; fi
+    log_warn "No valid mappings. Try again."
+    render_header; render_log_box
+    read_line "map your Port Forwarding (example 8443=443 8080=8880): " MAPS
+  done
+
+  read_line "connection count (default ${def_conn}): " CONN_COUNT "$def_conn"
+  if ! [[ "$CONN_COUNT" =~ ^[0-9]+$ ]] || (( CONN_COUNT < 1 || CONN_COUNT > 10000 )); then
+    CONN_COUNT="$def_conn"
+  fi
+
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}KCP mode${c_reset}"
+    echo "1) fast"
+    echo "2) fast2"
+    echo "3) fast3"
+    echo "4) manual"
+    echo
+    if ! ask_choice_once "Select: " KCP_CHOICE 1 2 3 4; then
+      continue
+    fi
+    break
+  done
+  case "$KCP_CHOICE" in
+    1) KCP_MODE="fast" ;;
+    2) KCP_MODE="fast2" ;;
+    3) KCP_MODE="fast3" ;;
+    4) KCP_MODE="manual" ;;
+  esac
+
+  read_line "set mtu (default ${def_mtu}): " MTU "$def_mtu"
+  if ! [[ "$MTU" =~ ^[0-9]+$ ]] || (( MTU < 50 || MTU > 1500 )); then
+    MTU="$def_mtu"
+  fi
+
+  local iface_guess
+  iface_guess="$(default_interface || true)"
+  [[ -z "$iface_guess" ]] && iface_guess="not found"
+  read_line "interface (your interface is ${iface_guess}): " INTERFACE "${iface_guess}"
+  [[ "$INTERFACE" == "not found" ]] && INTERFACE=""
+
+  read_line "input your key: " KEY "$def_key"
+  while [[ -z "$KEY" ]]; do
+    log_warn "Key cannot be empty"
+    render_header; render_log_box
+    read_line "input your key: " KEY "$def_key"
+  done
+
+  if [[ "$KCP_MODE" == "manual" ]]; then
+    render_header; render_log_box
+    log_info "Manual KCP parameters"
+    read_line "KCP_NODELAY (default 1): " KCP_NODELAY "1"
+    read_line "KCP_INTERVAL ms (default 10): " KCP_INTERVAL "10"
+    read_line "KCP_RESEND (default 2): " KCP_RESEND "2"
+    read_line "KCP_NC (default 1): " KCP_NC "1"
+    read_line "KCP_RCVWND (default 1024): " KCP_RCVWND "1024"
+    read_line "KCP_SNDWND (default 1024): " KCP_SNDWND "1024"
+    read_line "KCP_SMUXBUF (default 4194304): " KCP_SMUXBUF "4194304"
+    read_line "KCP_STREAMBUF (default 2097152): " KCP_STREAMBUF "2097152"
+  else
+    kcp_apply_preset "$KCP_MODE" "client"
+    log_info "Applied KCP preset for client: $KCP_MODE"
+  fi
+
+  render_header; render_log_box
+  log_info "Collecting client network info..."
+  server_network_info ""
+
+  local new_cfg=""
+  new_cfg="$(write_client_yaml "$tunnel_id" "$SERVER_IP" "$SERVER_PORT" "$CONN_COUNT" "$KCP_MODE" "$MTU" "$KEY" "$FORWARDS_YAML")"
+
+  if ! validate_config_file "$new_cfg"; then
+    log_err "Config validation failed."
+    pause_enter
+    return 0
+  fi
+
+  write_systemd_service_file "client" "$tunnel_id" "$new_cfg" >/dev/null 2>&1 || true
+
+  svc_restart "$service_name"
+  pause_enter
+  return 0
+}
+
+server_extract_listen_port_from_cfg() {
+  local cfg="$1"
+  awk -F'"' '/^[[:space:]]*addr:[[:space:]]*"/ {print $2}' "$cfg" 2>/dev/null \
+    | awk -F':' 'NF>=2 {print $2; exit}'
+}
+
+server_rewrite_full_config_from_manage() {
+  local service_name="$1"
+  local cfg; cfg="$(cfg_path_from_service "$service_name")"
+  if [[ ! -f "$cfg" ]]; then
+    log_err "Config not found: $cfg"
+    pause_enter
+    return 0
+  fi
+
+  local tunnel_id="${service_name##*-}"
+
+  local def_listen def_conn def_mode def_mtu def_key
+  def_listen="$(server_extract_listen_port_from_cfg "$cfg")"
+  def_conn="$(extract_first_number_field "$cfg" "conn" "4")"
+  def_mode="$(extract_first_quoted_field "$cfg" "mode" "fast")"
+  def_mtu="$(extract_first_number_field "$cfg" "mtu" "1300")"
+  def_key="$(extract_first_quoted_field "$cfg" "key" "")"
+
+  [[ -z "$def_listen" ]] && def_listen="8484"
+  [[ -z "$def_conn" ]] && def_conn="4"
+  [[ -z "$def_mode" ]] && def_mode="fast"
+  [[ -z "$def_mtu" ]] && def_mtu="1300"
+
+  render_header; render_log_box
+  log_info "Rewrite server config for: $service_name"
+  echo "${c_bold}Rewrite Server Config${c_reset}"
+  echo
+
+  local SERVER_PORT CONN_COUNT MTU
+  local KCP_CHOICE KCP_MODE KEY
+
+  read_line "listen port (default ${def_listen}): " SERVER_PORT "$def_listen"
+  SERVER_PORT="$(normalize_port "$SERVER_PORT" || true)"
+  [[ -z "$SERVER_PORT" ]] && SERVER_PORT="$def_listen"
+
+  read_line "connection count (default ${def_conn}): " CONN_COUNT "$def_conn"
+  if ! [[ "$CONN_COUNT" =~ ^[0-9]+$ ]] || (( CONN_COUNT < 1 || CONN_COUNT > 10000 )); then
+    CONN_COUNT="$def_conn"
+  fi
+
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}KCP mode${c_reset}"
+    echo "1) fast"
+    echo "2) fast2"
+    echo "3) fast3"
+    echo "4) manual"
+    echo
+    if ! ask_choice_once "Select: " KCP_CHOICE 1 2 3 4; then
+      continue
+    fi
+    break
+  done
+  case "$KCP_CHOICE" in
+    1) KCP_MODE="fast" ;;
+    2) KCP_MODE="fast2" ;;
+    3) KCP_MODE="fast3" ;;
+    4) KCP_MODE="manual" ;;
+  esac
+
+  read_line "set mtu (default ${def_mtu}): " MTU "$def_mtu"
+  if ! [[ "$MTU" =~ ^[0-9]+$ ]] || (( MTU < 50 || MTU > 1500 )); then
+    MTU="$def_mtu"
+  fi
+
+  local iface_guess
+  iface_guess="$(default_interface || true)"
+  [[ -z "$iface_guess" ]] && iface_guess="not found"
+  read_line "interface (your interface is ${iface_guess}): " INTERFACE "${iface_guess}"
+  [[ "$INTERFACE" == "not found" ]] && INTERFACE=""
+
+  read_line "key (default keep current): " KEY "$def_key"
+  while [[ -z "$KEY" ]]; do
+    log_warn "Key cannot be empty"
+    render_header; render_log_box
+    read_line "key (default keep current): " KEY "$def_key"
+  done
+
+  if [[ "$KCP_MODE" == "manual" ]]; then
+    render_header; render_log_box
+    log_info "Manual KCP parameters"
+    read_line "KCP_NODELAY (default 1): " KCP_NODELAY "1"
+    read_line "KCP_INTERVAL ms (default 10): " KCP_INTERVAL "10"
+    read_line "KCP_RESEND (default 2): " KCP_RESEND "2"
+    read_line "KCP_NC (default 1): " KCP_NC "1"
+    read_line "KCP_RCVWND (default 2048): " KCP_RCVWND "2048"
+    read_line "KCP_SNDWND (default 2048): " KCP_SNDWND "2048"
+    read_line "KCP_SMUXBUF (default 4194304): " KCP_SMUXBUF "4194304"
+    read_line "KCP_STREAMBUF (default 2097152): " KCP_STREAMBUF "2097152"
+  else
+    kcp_apply_preset "$KCP_MODE" "server"
+    log_info "Applied KCP preset for server: $KCP_MODE"
+  fi
+
+  render_header; render_log_box
+  log_info "Collecting server network info..."
+  server_network_info ""
+
+  local new_cfg=""
+  new_cfg="$(write_server_yaml "$tunnel_id" "$SERVER_PORT" "$CONN_COUNT" "$KCP_MODE" "$MTU" "$KEY")"
+
+  if ! validate_config_file "$new_cfg"; then
+    log_err "Config validation failed."
+    pause_enter
+    return 0
+  fi
+
+  write_systemd_service_file "server" "$tunnel_id" "$new_cfg" >/dev/null 2>&1 || true
+
+  svc_restart "$service_name"
+  pause_enter
+  return 0
+}
+
+manage_one_service_menu() {
+  local s="$1"
+  local role="unknown"
+  if [[ "$s" == paqet-client-* ]]; then role="client"; fi
+  if [[ "$s" == paqet-server-* ]]; then role="server"; fi
+
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}Manage: ${s}${c_reset}"
+    echo
+
+    if [[ "$role" == "client" ]]; then
+      echo "1) change forward port mapping"
+      echo "2) change config"
+      echo "3) stop & disable"
+      echo "4) start & enable"
+      echo "5) restart"
+      echo "6) clean"
+      echo "7) back"
+      echo
+      local ch=""
+      if ! ask_choice_once "Select: " ch 1 2 3 4 5 6 7; then
+        continue
+      fi
+      case "$ch" in
+        1) client_manage_forward_mapping "$s" ;;
+        2) client_rewrite_full_config_from_manage "$s" ;;
+        3) svc_stop_disable "$s" ; pause_enter ;;
+        4) svc_start_enable "$s" ; pause_enter ;;
+        5) svc_restart "$s" ; pause_enter ;;
+        6) svc_clean_one "$s" ; pause_enter ; return 0 ;;
+        7) return 0 ;;
+      esac
+    else
+      echo "1) change config"
+      echo "2) stop & disable"
+      echo "3) start & enable"
+      echo "4) restart"
+      echo "5) clean"
+      echo "6) back"
+      echo
+      local ch=""
+      if ! ask_choice_once "Select: " ch 1 2 3 4 5 6; then
+        continue
+      fi
+      case "$ch" in
+        1) server_rewrite_full_config_from_manage "$s" ;;
+        2) svc_stop_disable "$s" ; pause_enter ;;
+        3) svc_start_enable "$s" ; pause_enter ;;
+        4) svc_restart "$s" ; pause_enter ;;
+        5) svc_clean_one "$s" ; pause_enter ; return 0 ;;
+        6) return 0 ;;
+      esac
+    fi
+  done
+}
+
+menu_manage_services() {
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}4) manage services${c_reset}"
+    echo
+
+    local services=()
+    mapfile -t services < <(list_paqet_services || true)
+
+    if ((${#services[@]} == 0)); then
+      log_warn "No paqet services found (paqet-client-* / paqet-server-*)"
+      echo "No paqet services found."
+      echo
+      echo "1) back"
+      echo
+      local ch=""
+      if ! ask_choice_once "Select: " ch 1; then
+        continue
+      fi
+      return 0
+    fi
+
+    local idx=1
+    for s in "${services[@]}"; do
+      echo "${idx}) ${s}"
+      idx=$((idx+1))
+    done
+    echo "${idx}) back"
+    echo
+
+    local ch=""
+    local allowed=()
+    local i
+    for ((i=1;i<=idx;i++)); do allowed+=("$i"); done
+    if ! ask_choice_once "Select: " ch "${allowed[@]}"; then
+      continue
+    fi
+    if [[ "$ch" == "$idx" ]]; then
+      return 0
+    fi
+
+    local picked="${services[$((ch-1))]}"
+    manage_one_service_menu "$picked"
+  done
+}
+
+write_atomic() {
+  local path="$1"
+  local tmp="${path}.tmp.$$"
+  cat > "$tmp"
+  chmod 644 "$tmp" >/dev/null 2>&1 || true
+  mv -f "$tmp" "$path"
+}
+
+optimizer_apply() {
+  local sysctl_conf="/etc/sysctl.d/99-paqet.conf"
+  local logrotate_conf="/etc/logrotate.d/rsyslog"
+
+  log_info "Optimizer: write sysctl config"
+  render_header; render_log_box
+
+  write_atomic "$sysctl_conf" <<'EOF'
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.ip_local_port_range = 1024 65535
+fs.file-max = 2097152
+
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+net.ipv4.tcp_syncookies = 1
+
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
+EOF
+
+  log_info "Applying sysctl"
+  render_header; render_log_box
+  sysctl --system >/dev/null 2>&1 || true
+  log_ok "Sysctl applied"
+
+  log_info "Optimizer: write logrotate config"
+  render_header; render_log_box
+
+  write_atomic "$logrotate_conf" <<'EOF'
+/var/log/syslog
+/var/log/mail.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/cron.log
+{
+        rotate 0
+        daily
+        size 5G
+        missingok
+        notifempty
+        compress
+        delaycompress
+        sharedscripts
+        postrotate
+                /usr/lib/rsyslog/rsyslog-rotate
+        endscript
+}
+EOF
+
+  log_info "Running logrotate (dry-run)"
+  render_header; render_log_box
+  logrotate -d /etc/logrotate.conf >/dev/null 2>&1 || true
+
+  log_info "Running logrotate (force)"
+  render_header; render_log_box
+  logrotate -f /etc/logrotate.conf >/dev/null 2>&1 || true
+
+  log_ok "Optimizer applied successfully"
+  pause_enter
+}
+
+optimizer_delete() {
+  local sysctl_conf="/etc/sysctl.d/99-paqet.conf"
+  local logrotate_conf="/etc/logrotate.d/rsyslog"
+
+  log_info "Optimizer: delete configs"
+  render_header; render_log_box
+
+  rm -f "$sysctl_conf" >/dev/null 2>&1 || true
+  rm -f "$logrotate_conf" >/dev/null 2>&1 || true
+
+  log_info "Re-applying sysctl"
+  render_header; render_log_box
+  sysctl --system >/dev/null 2>&1 || true
+
+  log_ok "Optimizer deleted (best-effort revert)"
+  pause_enter
+}
+
+optimizer_menu() {
+  local c=""
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}5) optimize${c_reset}"
+    echo
+    echo "1) Apply"
+    echo "2) Delete"
+    echo "0) Back"
+    echo
+    if ! ask_choice_once "Select: " c 1 2 0; then
+      continue
+    fi
+    case "$c" in
+      1) log_info "Optimizer: Apply"; optimizer_apply; return 0 ;;
+      2) log_info "Optimizer: Delete"; optimizer_delete; return 0 ;;
+      0) return 0 ;;
+    esac
+  done
+}
+
+uninstall_all() {
+  render_header; render_log_box
+  echo "${c_bold}UNINSTALL ALL${c_reset}"
+  echo
+  echo "This will:"
+  echo " - stop & disable ALL paqet-client-* and paqet-server-* services"
+  echo " - delete their service files and yaml configs"
+  echo " - delete /usr/local/bin/paqet"
+  echo
+  local confirm=""
+  read_line "Type 'yes' to confirm: " confirm
+  confirm="${confirm// /}"
+  if [[ "$confirm" != "yes" ]]; then
+    log_warn "Uninstall cancelled"
+    pause_enter
+    return 0
+  fi
+
+  local services=()
+  mapfile -t services < <(list_paqet_services || true)
+
+  local s
+  for s in "${services[@]}"; do
+    log_info "Uninstall: $s"
+    systemctl disable --now "$s" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${s}.service" >/dev/null 2>&1 || true
+    rm -f "/etc/paqet/${s}.yaml" >/dev/null 2>&1 || true
+    render_header; render_log_box
+  done
+
+  rm -f /etc/paqet/paqet-client-*.yaml /etc/paqet/paqet-server-*.yaml >/dev/null 2>&1 || true
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if [[ -f /usr/local/bin/paqet ]]; then
+    rm -f /usr/local/bin/paqet >/dev/null 2>&1 || true
+    log_ok "Removed /usr/local/bin/paqet"
+  else
+    log_info "paqet binary not found at /usr/local/bin/paqet"
+  fi
+
+  log_ok "Uninstall all completed"
+  pause_enter
+}
+
+main_menu() {
+  while true; do
+    render_header; render_log_box
+    echo "${c_bold}Main Menu${c_reset}"
+    echo
+    echo "1) install Core and Deps"
+    echo "2) Setup Server"
+    echo "3) Setup Client"
+    echo "4) manage services"
+    echo "5) optimize"
+    echo "6) uninstall"
+    echo
+    local ch=""
+    if ! ask_choice_once "Select: " ch 1 2 3 4 5 6; then
+      continue
+    fi
+    case "$ch" in
+      1) menu_install_core_and_deps ;;
+      2) menu_setup_server ;;
+      3) menu_setup_client ;;
+      4) menu_manage_services ;;
+      5) optimizer_menu ;;
+      6) uninstall_all ;;
+    esac
+  done
+}
+
+
+is_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS=.
+  read -r a b c d <<<"$ip"
+  for o in "$a" "$b" "$c" "$d"; do
+    [[ "$o" =~ ^[0-9]+$ ]] || return 1
+    (( o>=0 && o<=255 )) || return 1
+  done
+  return 0
+}
+
+cli_usage() {
+  echo "Usage:"
+  echo "  ./shah kharej <TID> <LISTEN_PORT> <CONN> <MODE> <MTU> <IFACE|auto> [--firewall] [--start] [--key KEY] [--kcp-...]"
+  echo "  ./shah iran   <TID> \"<MAPS>\" <SERVER_IP> <SERVER_PORT> <CONN> <MODE> <MTU> <IFACE|auto> <KEY> [--start] [--kcp-...]"
+  echo
+  echo "MODE: fast | fast2 | fast3 | manual"
+  echo
+  echo "KCP manual flags (only needed when MODE=manual):"
+  echo "  --kcp-nodelay N     (0/1)"
+  echo "  --kcp-interval N    (ms)"
+  echo "  --kcp-resend N      (0-2)"
+  echo "  --kcp-nc N          (0/1)"
+  echo "  --kcp-rcvwnd N"
+  echo "  --kcp-sndwnd N"
+  echo "  --kcp-smuxbuf N"
+  echo "  --kcp-streambuf N"
+  echo
+  echo "Examples:"
+  echo "  ./shah kharej 44 8443 4 fast   1300 auto --firewall --start"
+  echo "  ./shah iran   44 \"8443=8443 80=8080\" 10.10.20.10 8443 4 fast 1300 auto YOUR_KEY --start"
+  echo
+  echo "Manual example:"
+  echo "  ./shah kharej 45 9000 6 manual 1300 ens3 --key YOUR_KEY --kcp-interval 10 --kcp-resend 2 --kcp-rcvwnd 4096 --kcp-sndwnd 4096 --start"
+  echo "  ./shah iran   45 \"9000=9000\" 10.10.20.10 9000 6 manual 1300 auto YOUR_KEY --kcp-interval 10 --kcp-resend 2 --kcp-rcvwnd 2048 --kcp-sndwnd 2048 --start"
+}
+
+is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
+cli_set_kcp_defaults() {
+  local role="$1" # server|client
+  KCP_NODELAY="1"
+  KCP_INTERVAL="10"
+  KCP_RESEND="2"
+  KCP_NC="1"
+  KCP_SMUXBUF="4194304"
+  KCP_STREAMBUF="2097152"
+  if [[ "$role" == "server" ]]; then
+    KCP_RCVWND="2048"
+    KCP_SNDWND="2048"
+  else
+    KCP_RCVWND="1024"
+    KCP_SNDWND="1024"
+  fi
+}
+
+cli_apply_kcp_flag() {
+  local role="$1" flag="$2" val="$3"
+  case "$flag" in
+    --kcp-nodelay)  is_uint "$val" && { [[ "$val" == "0" || "$val" == "1" ]]; } || return 1; KCP_NODELAY="$val" ;;
+    --kcp-interval) is_uint "$val" || return 1; KCP_INTERVAL="$val" ;;
+    --kcp-resend)   is_uint "$val" || return 1; KCP_RESEND="$val" ;;
+    --kcp-nc)       is_uint "$val" && { [[ "$val" == "0" || "$val" == "1" ]]; } || return 1; KCP_NC="$val" ;;
+    --kcp-rcvwnd)   is_uint "$val" || return 1; KCP_RCVWND="$val" ;;
+    --kcp-sndwnd)   is_uint "$val" || return 1; KCP_SNDWND="$val" ;;
+    --kcp-smuxbuf)  is_uint "$val" || return 1; KCP_SMUXBUF="$val" ;;
+    --kcp-streambuf) is_uint "$val" || return 1; KCP_STREAMBUF="$val" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+cli_run_kharej() {
+  local tid="${1:-}" listen_port="${2:-}" conn="${3:-}" mode="${4:-}" mtu="${5:-}" iface="${6:-}"
+  shift 6 || true
+
+  if [[ -z "$tid" || -z "$listen_port" || -z "$conn" || -z "$mode" || -z "$mtu" || -z "$iface" ]]; then
+    cli_usage; exit 1
+  fi
+
+  if ! is_uint "$tid" || (( tid < 1 || tid > 999 )); then echo "Invalid TID"; exit 1; fi
+  listen_port="$(normalize_port "$listen_port" || true)"; [[ -z "$listen_port" ]] && { echo "Invalid LISTEN_PORT"; exit 1; }
+  if ! is_uint "$conn" || (( conn < 1 || conn > 256 )); then echo "Invalid CONN"; exit 1; fi
+  case "$mode" in fast|fast2|fast3|manual) ;; *) echo "Invalid MODE"; exit 1 ;; esac
+  if ! is_uint "$mtu" || (( mtu < 50 || mtu > 1500 )); then echo "Invalid MTU"; exit 1; fi
+
+  local do_firewall="0" do_start="0" key_override=""
+  cli_set_kcp_defaults "server"
+
+  while (($#)); do
+    case "$1" in
+      --firewall) do_firewall="1"; shift ;;
+      --start) do_start="1"; shift ;;
+      --key) shift; key_override="${1:-}"; [[ -z "$key_override" ]] && { echo "Missing KEY after --key"; exit 1; }; shift ;;
+      --kcp-*) 
+        local f="$1"; shift
+        local v="${1:-}"; [[ -z "$v" ]] && { echo "Missing value for $f"; exit 1; }
+        if ! cli_apply_kcp_flag "server" "$f" "$v"; then echo "Invalid value for $f"; exit 1; fi
+        shift
+        ;;
+      *) echo "Unknown flag: $1"; exit 1 ;;
+    esac
+  done
+
+  if [[ "$iface" == "auto" ]]; then
+    INTERFACE=""
+  else
+    INTERFACE="$iface"
+  fi
+
+  if [[ "$mode" != "manual" ]]; then
+    kcp_apply_preset "$mode" "server"
+  fi
+
+  local KEY=""
+  if [[ -n "$key_override" ]]; then
+    KEY="$key_override"
+  else
+    if ensure_cmd openssl; then
+      KEY="$(openssl rand -base64 32 | tr -d '
+' | tr -d '=' | tr '/+' 'ab')"
+    else
+      KEY="$(head -c 48 /dev/urandom | base64 | tr -d '
+' | tr -d '=' | tr '/+' 'ab')"
+    fi
+  fi
+
+  render_header; render_log_box
+  echo "${c_bold}${c_green}YOUR KEY (copy it)${c_reset}"
+  hr "-"
+  echo "${c_bold}${KEY}${c_reset}"
+  hr "-"
+  echo
+
+  log_info "Collecting server network info..."
+  server_network_info ""
+
+  local cfg=""
+  cfg="$(write_server_yaml "$tid" "$listen_port" "$conn" "$mode" "$mtu" "$KEY")"
+
+  if ! validate_config_file "$cfg"; then
+    log_err "Config validation failed."
+    exit 1
+  fi
+
+  local svc=""
+  svc="$(write_systemd_service_file "server" "$tid" "$cfg")"
+
+  if [[ "$do_firewall" == "1" ]]; then
+    firewall_setup "$listen_port"
+  fi
+
+  if [[ "$do_start" == "1" ]]; then
+    enable_start_and_show_status "$svc"
+  else
+    log_info "Created service: $svc (not started). Run: systemctl enable --now $svc"
+  fi
+}
+
+cli_run_iran() {
+  local tid="${1:-}" maps="${2:-}" server_ip="${3:-}" server_port="${4:-}" conn="${5:-}" mode="${6:-}" mtu="${7:-}" iface="${8:-}" key="${9:-}"
+  shift 9 || true
+
+  if [[ -z "$tid" || -z "$maps" || -z "$server_ip" || -z "$server_port" || -z "$conn" || -z "$mode" || -z "$mtu" || -z "$iface" || -z "$key" ]]; then
+    cli_usage; exit 1
+  fi
+
+  if ! is_uint "$tid" || (( tid < 1 || tid > 999 )); then echo "Invalid TID"; exit 1; fi
+  if ! is_ipv4 "$server_ip"; then echo "Invalid SERVER_IP"; exit 1; fi
+  server_port="$(normalize_port "$server_port" || true)"; [[ -z "$server_port" ]] && { echo "Invalid SERVER_PORT"; exit 1; }
+  if ! is_uint "$conn" || (( conn < 1 || conn > 256 )); then echo "Invalid CONN"; exit 1; fi
+  case "$mode" in fast|fast2|fast3|manual) ;; *) echo "Invalid MODE"; exit 1 ;; esac
+  if ! is_uint "$mtu" || (( mtu < 50 || mtu > 1500 )); then echo "Invalid MTU"; exit 1; fi
+
+  local do_start="0"
+  cli_set_kcp_defaults "client"
+
+  while (($#)); do
+    case "$1" in
+      --start) do_start="1"; shift ;;
+      --kcp-*)
+        local f="$1"; shift
+        local v="${1:-}"; [[ -z "$v" ]] && { echo "Missing value for $f"; exit 1; }
+        if ! cli_apply_kcp_flag "client" "$f" "$v"; then echo "Invalid value for $f"; exit 1; fi
+        shift
+        ;;
+      *) echo "Unknown flag: $1"; exit 1 ;;
+    esac
+  done
+
+  if [[ "$iface" == "auto" ]]; then
+    INTERFACE=""
+  else
+    INTERFACE="$iface"
+  fi
+
+  local FORWARDS_YAML=""
+  FORWARDS_YAML="$(parse_forward_mappings "$maps" "$server_ip")"
+  if [[ -z "$FORWARDS_YAML" ]]; then
+    echo "Invalid MAPS. Example: \"8443=8443 80=8080\""
+    exit 1
+  fi
+
+  if [[ "$mode" != "manual" ]]; then
+    kcp_apply_preset "$mode" "client"
+  fi
+
+  render_header; render_log_box
+  log_info "Collecting client network info..."
+  server_network_info ""
+
+  local cfg=""
+  cfg="$(write_client_yaml "$tid" "$server_ip" "$server_port" "$conn" "$mode" "$mtu" "$key" "$FORWARDS_YAML")"
+
+  if ! validate_config_file "$cfg"; then
+    log_err "Config validation failed."
+    exit 1
+  fi
+
+  local svc=""
+  svc="$(write_systemd_service_file "client" "$tid" "$cfg")"
+
+  if [[ "$do_start" == "1" ]]; then
+    enable_start_and_show_status "$svc"
+  else
+    log_info "Created service: $svc (not started). Run: systemctl enable --now $svc"
+  fi
+}
+
+shah_cli_entry() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || return 1
+  case "$cmd" in
+    kharej)
+      shift
+      if (($# < 6)); then cli_usage; return 0; fi
+      cli_run_kharej "$@"; return $? ;;
+    iran)
+      shift
+      if (($# < 9)); then cli_usage; return 0; fi
+      cli_run_iran "$@"; return $? ;;
+    help|--help|-h)
+      cli_usage; return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+trap 'ec=$?; log_err "Unexpected error (exit code $ec) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"; render_header; render_log_box; echo; echo "An error occurred. Returning to main menu..."; sleep 1' ERR
+
+require_root
+detect_distro
+detect_arch
+log_info "Wizard started. Distro=${DISTRO} ${DISTRO_VER}, Arch=${ARCH_TAG}"
+if shah_cli_entry "$@"; then exit $?; fi
+main_menu
